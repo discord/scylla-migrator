@@ -3,9 +3,12 @@ package com.scylladb.migrator
 import com.datastax.spark.connector._
 import com.datastax.spark.connector.cql._
 import com.datastax.spark.connector.rdd.ReadConf
+import com.datastax.spark.connector.writer.{ CassandraRowWriter, WriteConf }
 import com.google.common.math.DoubleMath
 import org.apache.log4j.{ Level, LogManager, Logger }
+import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.SparkSession
+import org.joda.time.{ DateTime, DateTimeZone }
 
 case class RowComparisonFailure(row: CassandraRow,
                                 other: Option[CassandraRow],
@@ -43,6 +46,7 @@ object RowComparisonFailure {
 
   def compareRows(left: CassandraRow,
                   right: Option[CassandraRow],
+                  writetimeCutoff: Long,
                   floatingPointTolerance: Double,
                   ttlToleranceMillis: Long,
                   writetimeToleranceMillis: Long,
@@ -74,10 +78,11 @@ object RowComparisonFailure {
           for {
             name <- names
             if !name.endsWith("_ttl") && !name.endsWith("_writetime")
+
             leftValue  = leftMap.get(name)
             rightValue = rightMap.get(name)
 
-            result = (rightValue, leftValue) match {
+            hasDiff = (rightValue, leftValue) match {
               // All floating-point-like types need to be compared with a configured tolerance
               case (Some(l: Float), Some(r: Float)) =>
                 !DoubleMath.fuzzyEquals(l, r, floatingPointTolerance)
@@ -124,6 +129,21 @@ object RowComparisonFailure {
               case (Some(_), None)    => true
               case (None, Some(_))    => true
               case (None, None)       => false
+            }
+
+            // Diffs are ignored if the column was written to before the cutoff.
+            // This is because reading from the two clusters is not atomic, and
+            // any updates during validation could result in a false diff.
+            writetimeName = name + "_writetime"
+            result = if (hasDiff && !compareTimestamps && left.contains(writetimeName)) {
+              val leftWritetimeValue = left.getLongOption(writetimeName)
+              val rightWritetimeValue = right.getLongOption(writetimeName)
+              (leftWritetimeValue, rightWritetimeValue) match {
+                case (Some(l), Some(r)) => l < writetimeCutoff && r < writetimeCutoff
+                case _                  => hasDiff
+              }
+            } else {
+              hasDiff
             }
             if result
           } yield name
@@ -190,11 +210,13 @@ object Validator {
   val log = LogManager.getLogger("com.scylladb.migrator")
 
   def runValidation(config: MigratorConfig)(
-    implicit spark: SparkSession): List[RowComparisonFailure] = {
+    implicit spark: SparkSession): RDD[RowComparisonFailure] = {
     val sourceConnector: CassandraConnector =
       Connectors.sourceConnector(spark.sparkContext.getConf, config.source)
     val targetConnector: CassandraConnector =
       Connectors.targetConnector(spark.sparkContext.getConf, config.target)
+
+    val writetimeCutoff = DateTime.now(DateTimeZone.UTC).getMillis() * 1000;
 
     val renameMap = config.renames.map(rename => rename.from -> rename.to).toMap
     val sourceTableDef =
@@ -211,7 +233,13 @@ object Validator {
               WriteTime(colDef.columnName, Some(alias + "_writetime")),
               TTL(colDef.columnName, Some(alias + "_ttl"))
             )
-          else List(ColumnName(colDef.columnName, Some(alias)))
+          else if (!colDef.isCollection)
+            List(
+              ColumnName(colDef.columnName, Some(alias)),
+              WriteTime(colDef.columnName, Some(alias + "_writetime"))
+            )
+          else
+            List(ColumnName(colDef.columnName))
         }
 
       val primaryKeyProjection =
@@ -243,7 +271,13 @@ object Validator {
               WriteTime(renamedColName, Some(renamedColName + "_writetime")),
               TTL(renamedColName, Some(renamedColName + "_ttl"))
             )
-          else List(ColumnName(renamedColName))
+          else if (!colDef.isCollection)
+            List(
+              ColumnName(renamedColName),
+              WriteTime(renamedColName, Some(renamedColName + "_writetime"))
+            )
+          else
+            List(ColumnName(renamedColName))
         }
 
       val primaryKeyProjection =
@@ -268,14 +302,62 @@ object Validator {
           RowComparisonFailure.compareRows(
             l,
             r,
+            writetimeCutoff,
             config.validation.floatingPointTolerance,
             config.validation.ttlToleranceMillis,
             config.validation.writetimeToleranceMillis,
             config.validation.compareTimestamps
           )
       }
-      .take(config.validation.failuresToFetch)
-      .toList
+  }
+
+  def remediateValidation(config: MigratorConfig, rdd: RDD[RowComparisonFailure])(
+    implicit spark: SparkSession): RDD[CassandraRow] = {
+    val sourceConnector: CassandraConnector =
+      Connectors.sourceConnector(spark.sparkContext.getConf, config.source)
+    val targetConnector: CassandraConnector =
+      Connectors.targetConnector(spark.sparkContext.getConf, config.target)
+    val writeConf = WriteConf.fromSparkConf(spark.sparkContext.getConf)
+    val columnRefs =
+      Schema
+        .tableFromCassandra(targetConnector, config.target.keyspace, config.target.table)
+        .columnRefs
+
+    // get all repairable rows
+    val rows = rdd
+      .flatMap { failure =>
+        (failure) match {
+          case RowComparisonFailure(row, _, List(RowComparisonFailure.Item.MissingTargetRow)) =>
+            Some(row)
+          case RowComparisonFailure(
+              row,
+              _,
+              List(RowComparisonFailure.Item.DifferingFieldValues(_))) =>
+            Some(row)
+          case default => {
+            log.error("Unrepairable comparison failure:\n${default.mkString()}")
+            None
+          }
+        }
+      }
+
+    val newRows = rows
+      .joinWithCassandraTable(
+        config.target.keyspace,
+        config.target.table
+      )
+      .withConnector(sourceConnector)
+      .withReadConf(ReadConf.fromSparkConf(spark.sparkContext.getConf))
+      .map { case (_, row) => row }
+
+    newRows
+      .saveToCassandra(
+        config.target.keyspace,
+        config.target.table,
+        AllColumns,
+        WriteConf.fromSparkConf(spark.sparkContext.getConf)
+      )(targetConnector, CassandraRowWriter.Factory)
+    newRows
   }
 
   def main(args: Array[String]): Unit = {
@@ -297,12 +379,19 @@ object Validator {
 
     log.info(s"Loaded config: ${migratorConfig}")
 
-    val failures = runValidation(migratorConfig)
+    val failures = runValidation(migratorConfig).cache
 
-    if (failures.isEmpty) log.info("No comparison failures found - enjoy your day!")
-    else {
-      log.error("Found the following comparison failures:")
-      log.error(failures.mkString("\n"))
+    val failureCount = failures.count()
+    if (failureCount <= 0) {
+      log.info("No comparison failures found - enjoy your day!")
+    } else {
+      log.error(s"Found ${failureCount} comparison failures")
+      val timestamp = DateTime.now(DateTimeZone.UTC).getMillis();
+      failures
+        .coalesce(1)
+        .saveAsTextFile(
+          s"gs://dataproc-7290e922-fdf8-4832-a421-dd157b235d2d-us-east1/output/${migratorConfig.source.keyspace}/${migratorConfig.source.table}/${timestamp}/")
+      remediateValidation(migratorConfig, failures)
     }
   }
 }
