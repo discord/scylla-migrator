@@ -136,7 +136,8 @@ object Migrator {
 
   def readDataframe(source: SourceSettings,
                     preserveTimes: Boolean,
-                    tokenRangesToSkip: Set[(Token[_], Token[_])])(
+                    tokenRangesToSkip: Set[(Token[_], Token[_])],
+                    existingRDD: Option[RDD[CassandraRow]] = None)(
     implicit spark: SparkSession): (StructType, TableDef, DataFrame, CopyType) = {
     val connector = Connectors.sourceConnector(spark.sparkContext.getConf, source)
     val readConf = ReadConf
@@ -157,16 +158,28 @@ object Migrator {
 
     val selection = createSelection(tableDef, origSchema, preserveTimes).fold(throw _, identity)
 
-    val rdd = spark.sparkContext
-      .cassandraTable[CassandraSQLRow](
-        source.keyspace,
-        source.table,
-        (s, e) => !tokenRangesToSkip.contains((s, e)))
-      .withConnector(connector)
-      .withReadConf(readConf)
-      .select(selection.columnRefs: _*)
-      .asInstanceOf[RDD[Row]]
-
+    val rdd = existingRDD
+      .map {
+        _.joinWithCassandraTable(
+          source.keyspace,
+          source.table
+        ).withConnector(connector)
+          .withReadConf(readConf)
+          .select(selection.columnRefs: _*)
+          .map { case (_, row) => new CassandraSQLRow(row.metaData, row.columnValues) }
+          .asInstanceOf[RDD[Row]]
+      }
+      .getOrElse {
+        spark.sparkContext
+          .cassandraTable[CassandraSQLRow](
+            source.keyspace,
+            source.table,
+            (s, e) => !tokenRangesToSkip.contains((s, e)))
+          .withConnector(connector)
+          .withReadConf(readConf)
+          .select(selection.columnRefs: _*)
+          .asInstanceOf[RDD[Row]]
+      }
     // spark.createDataFrame does something weird with the encoder (tries to convert the row again),
     // so it's important to use createDataset with an explciit encoder instead here
     (

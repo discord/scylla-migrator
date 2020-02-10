@@ -3,11 +3,19 @@ package com.scylladb.migrator
 import com.datastax.spark.connector._
 import com.datastax.spark.connector.cql._
 import com.datastax.spark.connector.rdd.ReadConf
-import com.datastax.spark.connector.writer.{ CassandraRowWriter, WriteConf }
+import com.datastax.spark.connector.writer.{
+  CassandraRowWriter,
+  TTLOption,
+  TimestampOption,
+  TokenRangeAccumulator,
+  WriteConf
+}
 import com.google.common.math.DoubleMath
 import org.apache.log4j.{ Level, LogManager, Logger }
 import org.apache.spark.rdd.RDD
-import org.apache.spark.sql.SparkSession
+import org.apache.spark.sql.{ Row, SparkSession }
+import org.apache.spark.sql.cassandra.CassandraSQLRow
+import org.apache.spark.sql.types.{ LongType, StructField, StructType }
 import org.joda.time.{ DateTime, DateTimeZone }
 
 case class RowComparisonFailure(row: CassandraRow,
@@ -236,7 +244,8 @@ object Validator {
           else if (!colDef.isCollection)
             List(
               ColumnName(colDef.columnName, Some(alias)),
-              WriteTime(colDef.columnName, Some(alias + "_writetime"))
+              WriteTime(colDef.columnName, Some(alias + "_writetime")),
+              TTL(colDef.columnName, Some(alias + "_ttl"))
             )
           else
             List(ColumnName(colDef.columnName))
@@ -274,7 +283,8 @@ object Validator {
           else if (!colDef.isCollection)
             List(
               ColumnName(renamedColName),
-              WriteTime(renamedColName, Some(renamedColName + "_writetime"))
+              WriteTime(renamedColName, Some(renamedColName + "_writetime")),
+              TTL(colDef.columnName, Some(renamedColName + "_ttl"))
             )
           else
             List(ColumnName(renamedColName))
@@ -312,28 +322,18 @@ object Validator {
   }
 
   def remediateValidation(config: MigratorConfig, rdd: RDD[RowComparisonFailure])(
-    implicit spark: SparkSession): RDD[CassandraRow] = {
-    val sourceConnector: CassandraConnector =
-      Connectors.sourceConnector(spark.sparkContext.getConf, config.source)
-    val targetConnector: CassandraConnector =
-      Connectors.targetConnector(spark.sparkContext.getConf, config.target)
-    val writeConf = WriteConf.fromSparkConf(spark.sparkContext.getConf)
-    val columnRefs =
-      Schema
-        .tableFromCassandra(targetConnector, config.target.keyspace, config.target.table)
-        .columnRefs
-
+    implicit spark: SparkSession) = {
     // get all repairable rows
-    val rows = rdd
+    val newRDD: RDD[CassandraRow] = rdd
       .flatMap { failure =>
         (failure) match {
           case RowComparisonFailure(row, _, List(RowComparisonFailure.Item.MissingTargetRow)) =>
-            Some(row)
+            Some(row) //new CassandraSQLRow(row.metaData, row.columnValues))
           case RowComparisonFailure(
               row,
               _,
               List(RowComparisonFailure.Item.DifferingFieldValues(_))) =>
-            Some(row)
+            Some(row) //new CassandraSQLRow(row.metaData, row.columnValues))
           case default => {
             log.error("Unrepairable comparison failure:\n${default.mkString()}")
             None
@@ -341,23 +341,24 @@ object Validator {
         }
       }
 
-    val newRows = rows
-      .joinWithCassandraTable(
-        config.target.keyspace,
-        config.target.table
-      )
-      .withConnector(sourceConnector)
-      .withReadConf(ReadConf.fromSparkConf(spark.sparkContext.getConf))
-      .map { case (_, row) => row }
+    val (origSchema, tableDef, sourceDF, copyType) =
+      Migrator.readDataframe(
+        config.source,
+        config.preserveTimestamps,
+        config.skipTokenRanges,
+        Some(newRDD))
 
-    newRows
-      .saveToCassandra(
-        config.target.keyspace,
-        config.target.table,
-        AllColumns,
-        WriteConf.fromSparkConf(spark.sparkContext.getConf)
-      )(targetConnector, CassandraRowWriter.Factory)
-    newRows
+    val tokenRangeAccumulator = TokenRangeAccumulator.empty
+    spark.sparkContext.register(tokenRangeAccumulator, "Token ranges copied")
+
+    Migrator.writeDataframe(
+      config.target,
+      config.renames,
+      sourceDF,
+      origSchema,
+      tableDef,
+      copyType,
+      tokenRangeAccumulator)
   }
 
   def main(args: Array[String]): Unit = {
