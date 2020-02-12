@@ -392,7 +392,7 @@ object Validator {
         .coalesce(1)
         .saveAsTextFile(
           s"gs://dataproc-7290e922-fdf8-4832-a421-dd157b235d2d-us-east1/output/${migratorConfig.source.keyspace}/${migratorConfig.source.table}/${timestamp}/")
-      remediateValidation(migratorConfig, failures)
+      //remediateValidation(migratorConfig, failures)
     }
   }
 }
